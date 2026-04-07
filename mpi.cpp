@@ -21,7 +21,6 @@ inline bool edge(int u,int v){
     return adj[u*n+v];
 }
 
-static vector<int> pc_sort;
 static int pmax=0;
 static vector<int>best;
 
@@ -94,26 +93,25 @@ static int structbound(const vector<int>& cand){
 
 }
 
-static int knapbound(const vector<int>&cand,int budget){
+static int knapbound(vector<int> cand,int budget){
     if(budget<=0 or cand.empty()) return 0;
-    vector<bool>pres(N,false);
-    for(int v:cand) pres[v]=true;
+    
+    sort(cand.begin(), cand.end(), [&](int a, int b) {
+        int numA = profit[a], denA = cost[a];
+        int numB = profit[b], denB = cost[b];
+        if (numA * denB != numB * denA) return numA * denB > numB * denA;
+        return profit[a] > profit[b];
+    });
     int res=0;
     int currb=0;
-    int total=cand.size();
-    int seen=0;
-    for(int v:pc_sort){
-        if(seen==total) break;
-        if(pres[v]){
-            seen++;
-            if((currb+cost[v])<=budget){
-                res+=profit[v];
-                currb+=cost[v];
-            }
-            else{
-                res+=((profit[v]*(budget-currb))/cost[v]);
-                return res;
-            }
+    for(int i=0;i<cand.size();i++){
+        if((cost[cand[i]]+currb)<=budget){
+            res+=profit[cand[i]];
+            currb+=cost[cand[i]];
+        }
+        else{
+            res+=((profit[cand[i]]*(budget-currb))/cost[cand[i]]);
+            break;
         }
     }
     return res;
@@ -147,4 +145,5 @@ static void branch(const Problem& s,stack<Problem>&st){
         }
     }
 }
+
 

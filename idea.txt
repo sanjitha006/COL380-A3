@@ -24,3 +24,12 @@ Ranks 1…P−1:
        g. If new best found → MPI_Isend(NEW_BEST, rank 0)
        h. If local queue empty → MPI_Send(WORK_REQUEST, rank 0)
             → if EMPTY response AND no steal succeeds → send DONE, exit
+
+
+
+
+     //see how the communication works..first  ecplain the communication
+     idea: each has its own problem stack...now others broadcast when need work and these stacks when they keep on look for such broadcas
+     msg find this and send the problem in stack and reveive stuff from that process??
+     why need master to coordinate? master can also work,these guya can cooedinate..
+     
