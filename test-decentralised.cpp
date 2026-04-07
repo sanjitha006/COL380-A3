@@ -1,12 +1,13 @@
 /*
  * MPI Parallel Branch-and-Bound — Budgeted Maximum Clique Problem
  *
- * Architecture (Pure Master-Worker)
+ * Architecture: DECENTRALIZED WORK STEALING
  * ─────────────
- * • Master (Rank 0): Manages a dynamic task queue of subproblems.
- * • Workers (Ranks 1..P-1): Pull work, run the STRICT sequential BnB 
- * engine (local sorting for knapsack as per pseudocode), and report 
- * back tight bounds to prune the search space.
+ * • No Master Rank: All ranks perform computation.
+ * • Work Stealing: Idle ranks send TAG_STEAL_REQ to a randomly chosen peer.
+ * • Termination Detection: Dijkstra's Dual-Pass Token Ring algorithm.
+ * • Strict Sequential Bounding: Retains unmodified, strict bounding heuristics 
+ * to comply with assignment constraints.
  *
  * Compile : mpicxx -O3 -std=c++17 -o clique_mpi main.cpp
  * Run     : mpirun -n <P> ./clique_mpi input.txt output.txt
@@ -20,24 +21,25 @@ using namespace std;
 //  Message tags
 // ═══════════════════════════════════════════════════════════════════════════
 enum Tag {
-    TAG_WORK       = 1,   // master → worker  : here is a subproblem
-    TAG_WORK_REQ   = 2,   // worker → master  : give me more work
-    TAG_NO_MORE    = 3,   // master → worker  : no work left, terminate
-    TAG_NEW_BEST   = 4,   // worker ↔ master  : updated P_max
-    TAG_RESULT     = 5,   // worker → master  : final local best
+    TAG_STEAL_REQ  = 1,   // Idle rank asking for work
+    TAG_WORK       = 2,   // Busy rank sending half its stack
+    TAG_NACK       = 3,   // Busy rank has no work to spare
+    TAG_NEW_BEST   = 4,   // Someone found a new P_max
+    TAG_TOKEN      = 5,   // Dijkstra termination token
+    TAG_TERMINATE  = 6    // System is finished
 };
 
+// Colors for Dijkstra's Token algorithm
+enum Color { WHITE = 0, BLACK = 1 };
+
 // ═══════════════════════════════════════════════════════════════════════════
-//  Graph — replicated on every rank
+//  Graph
 // ═══════════════════════════════════════════════════════════════════════════
 static int           N, E, B;
 static vector<int>   profit, cost;
-static vector<uint8_t> adj;           // flat N×N adjacency matrix
+static vector<uint8_t> adj;
 inline bool edge(int u, int v) { return adj[u * N + v]; }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Per-rank best solution
-// ═══════════════════════════════════════════════════════════════════════════
 static int         g_pmax = 0;
 static vector<int> g_best;
 
@@ -45,7 +47,7 @@ static vector<int> g_best;
 //  Subproblem + serialisation
 // ═══════════════════════════════════════════════════════════════════════════
 struct Sub {
-    vector<int> cand;     // strictly ordered DESCENDING by profit
+    vector<int> cand;     
     vector<int> clique;   
     int P = 0;    
     int W = 0;    
@@ -72,84 +74,78 @@ static Sub unpackSub(const int* d) {
     return s;
 }
 
+// Pack a batch of subproblems for work stealing
+static vector<int> packBatch(const vector<Sub>& subs) {
+    vector<int> b;
+    b.push_back((int)subs.size());
+    for (const Sub& s : subs) {
+        auto p = packSub(s);
+        b.push_back((int)p.size());
+        b.insert(b.end(), p.begin(), p.end());
+    }
+    return b;
+}
+
+static vector<Sub> unpackBatch(const int* d) {
+    vector<Sub> out;
+    int idx = 0, n = d[idx++];
+    for (int i = 0; i < n; i++) {
+        int sz = d[idx++];
+        out.push_back(unpackSub(d + idx));
+        idx += sz;
+    }
+    return out;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Bounding functions (Strict Sequential Implementation)
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Structural bound: greedy graph colouring.
 static int colorBound(const vector<int>& cand) {
     int n = (int)cand.size();
     if (!n) return 0;
-    
     vector<int> col(n, -1);
-    int ub = 0;
-    int num_colors = 0;
-    
+    int ub = 0, num_colors = 0;
     for (int i = 0; i < n; i++) {
         int v = cand[i];
         bool placed = false;
         for (int c = 0; c < num_colors; c++) {
             bool conflict = false;
             for (int j = 0; j < i; j++) {
-                if (col[j] == c && edge(v, cand[j])) { 
-                    conflict = true; break; 
-                }
+                if (col[j] == c && edge(v, cand[j])) { conflict = true; break; }
             }
-            if (!conflict) {
-                col[i] = c;
-                placed = true; break;
-            }
+            if (!conflict) { col[i] = c; placed = true; break; }
         }
-        if (!placed) {
-            col[i] = num_colors++;
-            ub += profit[v]; // First item in new class is the max profit
-        }
+        if (!placed) { col[i] = num_colors++; ub += profit[v]; }
     }
     return ub;
 }
 
-// Resource bound: fractional knapsack on remaining budget.
-// Reverted to local sorting to strictly follow the pseudocode without pre-processing.
 static int knapsackBound(const vector<int>& cand, int rem) {
     if (rem <= 0 || cand.empty()) return 0;
-    
-    vector<int> ord(cand.size()); 
-    iota(ord.begin(), ord.end(), 0);
-    
-    // Sort locally by efficiency (p/c) using strict cross-multiplication
+    vector<int> ord(cand.size()); iota(ord.begin(), ord.end(), 0);
     sort(ord.begin(), ord.end(), [&](int a, int b) {
         int numA = profit[cand[a]], denA = cost[cand[a]];
         int numB = profit[cand[b]], denB = cost[cand[b]];
         if (numA * denB != numB * denA) return numA * denB > numB * denA;
         return profit[cand[a]] > profit[cand[b]];
     });
-    
     int ub = 0, left = rem;
     for (int idx : ord) {
         int v = cand[idx];
-        if (cost[v] <= left) { 
-            ub += profit[v]; 
-            left -= cost[v]; 
-        } else { 
-            ub += (profit[v] * left) / cost[v]; // floor of the fraction
-            break; 
-        }
+        if (cost[v] <= left) { ub += profit[v]; left -= cost[v]; } 
+        else { ub += (profit[v] * left) / cost[v]; break; }
     }
     return ub;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  expand() — process one BnB node
+//  expand() 
 // ═══════════════════════════════════════════════════════════════════════════
 static void expand(const Sub& sp, stack<Sub>& stk) {
-    // Strict control flow as per typical BnB: Check bounds -> prune if needed.
     if (sp.P + colorBound(sp.cand) <= g_pmax) return;
     if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) return;
 
     int n = (int)sp.cand.size();
-
-    // Loop through candidates. Going backwards pops from the "back" of the 
-    // candidate list, exactly mimicking 'while (!cand.empty()) { pop_back() }'
     for (int i = n - 1; i >= 0; i--) {
         int v = sp.cand[i];
         if (sp.W + cost[v] > B) continue;
@@ -169,231 +165,217 @@ static void expand(const Sub& sp, stack<Sub>& stk) {
         child.cand.reserve(n - i - 1);
 
         for (int j = i + 1; j < n; j++) {
-            if (edge(v, sp.cand[j])) {
-                child.cand.push_back(sp.cand[j]);
-            }
+            if (edge(v, sp.cand[j])) child.cand.push_back(sp.cand[j]);
         }
         stk.push(move(child));
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  rootDecompose() — rank 0 only
+//  Decentralized Compute Engine
 // ═══════════════════════════════════════════════════════════════════════════
-static deque<Sub> rootDecompose(int target) {
-    deque<Sub> q;
-    Sub root;
-    root.cand.resize(N);
-    iota(root.cand.begin(), root.cand.end(), 0);
-    
-    // Initial assignment constraint: "sort the candidate vertices in descending order of profit"
-    sort(root.cand.begin(), root.cand.end(), [](int a, int b){
-        if (profit[a] != profit[b]) return profit[a] > profit[b];
-        return a < b;
-    });
-    
-    q.push_back(root);
-
-    while ((int)q.size() < target && !q.empty()) {
-        auto it = max_element(q.begin(), q.end(), [](const Sub& a, const Sub& b){
-            return a.cand.size() < b.cand.size();
-        });
-        Sub sp = *it; q.erase(it);
-        if (sp.cand.empty()) { q.push_back(sp); break; }
-
-        if (sp.P + colorBound(sp.cand) <= g_pmax) continue;
-        if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) continue;
-
-        int v = sp.cand[0];
-
-        // Branch 1 : WITHOUT v
-        Sub without = sp;
-        without.cand.erase(without.cand.begin()); 
-        if (!without.cand.empty()) q.push_back(without);
-
-        // Branch 2 : WITH v
-        if (sp.W + cost[v] <= B) {
-            Sub with_v;
-            with_v.P = sp.P + profit[v];
-            with_v.W = sp.W + cost[v];
-            with_v.clique = sp.clique;
-            with_v.clique.push_back(v);
-            for (size_t i = 1; i < sp.cand.size(); i++) {
-                if (edge(v, sp.cand[i])) with_v.cand.push_back(sp.cand[i]);
-            }
-            if (with_v.P > g_pmax) { g_pmax = with_v.P; g_best = with_v.clique; }
-            q.push_back(with_v);
-        }
-    }
-    return q;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  MASTER — rank 0
-// ═══════════════════════════════════════════════════════════════════════════
-static void runMaster(int P, const char* out_filename) {
-    const int W = P - 1;
-
-    deque<Sub> Q = rootDecompose(W * 8); 
-
-    int global_best_p = g_pmax;
-    vector<int> global_best_c = g_best;
-
-    vector<bool> is_idle(P, false);
-    vector<bool> terminated(P, false);
-    terminated[0] = true;
-    int idle_count = 0;
-    int done_count = 0;
-
-    for (int r = 1; r <= W; r++) {
-        if (!Q.empty()) {
-            auto b = packSub(Q.front()); Q.pop_front();
-            MPI_Send(b.data(), (int)b.size(), MPI_INT, r, TAG_WORK, MPI_COMM_WORLD);
-        } else {
-            int d = 0;
-            MPI_Send(&d, 1, MPI_INT, r, TAG_NO_MORE, MPI_COMM_WORLD);
-            terminated[r] = true;
-            done_count++;
-        }
-    }
-
-    const int RBUF_SZ = 1 << 18; 
+static void runDecentralized(int rank, int P, const char* out_filename) {
+    const int RBUF_SZ = 1 << 20; // 1MB receive buffer
     vector<int> rbuf(RBUF_SZ);
-
-    while (done_count < W) {
-        MPI_Status st;
-        MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
-        int src = st.MPI_SOURCE;
-        int tag = st.MPI_TAG;
-
-        if (tag == TAG_WORK_REQ) {
-            if (!Q.empty()) {
-                auto b = packSub(Q.front()); Q.pop_front();
-                MPI_Send(b.data(), (int)b.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
-            } else {
-                is_idle[src] = true;
-                idle_count++;
-                if (idle_count == W - done_count) {
-                    for (int r = 1; r <= W; r++) {
-                        if (is_idle[r] && !terminated[r]) {
-                            int d = 0;
-                            MPI_Send(&d, 1, MPI_INT, r, TAG_NO_MORE, MPI_COMM_WORLD);
-                        }
-                    }
-                }
-            }
-        }
-        else if (tag == TAG_NEW_BEST) {
-            int np = rbuf[0];
-            if (np > global_best_p) {
-                global_best_p = np;
-                for (int r = 1; r <= W; r++)
-                    if (!terminated[r] && !is_idle[r] && r != src)
-                        MPI_Send(&global_best_p, 1, MPI_INT, r, TAG_NEW_BEST, MPI_COMM_WORLD);
-            }
-        }
-        else if (tag == TAG_RESULT) {
-            int lp = rbuf[0];
-            if (lp > global_best_p) {
-                global_best_p = lp;
-                global_best_c.clear();
-                int csz = rbuf[1];
-                for (int i = 0; i < csz; i++) global_best_c.push_back(rbuf[2 + i]);
-            }
-            terminated[src] = true;
-            done_count++;
-        }
-    }
-
-    sort(global_best_c.begin(), global_best_c.end());
-    
-    ofstream fout(out_filename);
-    if (!fout.is_open()) {
-        cerr << "Error: Could not open output file " << out_filename << "\n";
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    
-    fout << global_best_p << "\n";
-    for (int i = 0; i < (int)global_best_c.size(); i++) {
-        if (i) fout << " ";
-        fout << global_best_c[i];
-    }
-    fout << "\n";
-    fout.close();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  WORKER — ranks 1 … P-1
-// ═══════════════════════════════════════════════════════════════════════════
-static void runWorker(int rank, int P) {
-    const int RBUF_SZ = 1 << 18;
-    vector<int> rbuf(RBUF_SZ);
-
     stack<Sub> local;
-    bool wait_master = false;
-    bool done        = false;
 
-    auto sendResult = [&]() {
-        vector<int> b;
-        b.push_back(g_pmax);
-        b.push_back((int)g_best.size());
-        for (int v : g_best) b.push_back(v);
-        MPI_Send(b.data(), (int)b.size(), MPI_INT, 0, TAG_RESULT, MPI_COMM_WORLD);
+    // --- State Variables ---
+    bool is_idle = (rank != 0); // Rank 0 starts busy, others start idle
+    bool done = false;
+    bool steal_pending = false;
+    
+    // --- Dijkstra Token Variables ---
+    int  my_color = WHITE;
+    bool has_token = (rank == 0); // Rank 0 initiates the token
+    int  token_color = WHITE;
+
+    // Seed Random generator for random work stealing
+    srand(time(NULL) + rank);
+
+    // Rank 0 puts the root node onto its stack
+    if (rank == 0) {
+        Sub root;
+        root.cand.resize(N);
+        iota(root.cand.begin(), root.cand.end(), 0);
+        sort(root.cand.begin(), root.cand.end(), [](int a, int b){
+            if (profit[a] != profit[b]) return profit[a] > profit[b];
+            return a < b;
+        });
+        local.push(root);
+    }
+
+    auto passToken = [&]() {
+        if (has_token && is_idle) {
+            int out_token = (token_color == BLACK || my_color == BLACK) ? BLACK : WHITE;
+            int next_rank = (rank + 1) % P;
+            MPI_Send(&out_token, 1, MPI_INT, next_rank, TAG_TOKEN, MPI_COMM_WORLD);
+            my_color = WHITE; // Become clean again after passing
+            has_token = false;
+        }
     };
 
-    {
-        MPI_Status st;
-        MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
-        if (st.MPI_TAG == TAG_WORK) local.push(unpackSub(rbuf.data()));
-        else done = true;
-    }
-
     while (!done) {
+        // ── 1. Non-blocking Message Poll ──────────────────────────────────
         for (;;) {
             int flag = 0;
             MPI_Status st;
             MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &st);
-            if (!flag) break;
+            if (!flag) break; // Inbox empty
 
             int src = st.MPI_SOURCE;
             int tag = st.MPI_TAG;
             int cnt; MPI_Get_count(&st, MPI_INT, &cnt);
             MPI_Recv(rbuf.data(), cnt, MPI_INT, src, tag, MPI_COMM_WORLD, &st);
 
-            if (tag == TAG_NEW_BEST) {
-                int np = rbuf[0];
-                if (np > g_pmax) g_pmax = np;
+            switch (tag) {
+                case TAG_NEW_BEST: {
+                    int np = rbuf[0];
+                    if (np > g_pmax) g_pmax = np;
+                    break;
+                }
+                
+                case TAG_STEAL_REQ: {
+                    // Someone wants work. Do we have enough to share?
+                    if (local.size() >= 2) {
+                        int half = local.size() / 2;
+                        vector<Sub> donated;
+                        for (int i = 0; i < half; i++) {
+                            donated.push_back(local.top());
+                            local.pop();
+                        }
+                        auto sbuf = packBatch(donated);
+                        MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
+                        my_color = BLACK; // Sent work -> become Dirty
+                    } else {
+                        int d = 0;
+                        MPI_Send(&d, 1, MPI_INT, src, TAG_NACK, MPI_COMM_WORLD);
+                    }
+                    break;
+                }
+
+                case TAG_WORK: {
+                    auto subs = unpackBatch(rbuf.data());
+                    for (auto& s : subs) local.push(move(s));
+                    steal_pending = false;
+                    is_idle = false;
+                    break;
+                }
+
+                case TAG_NACK: {
+                    steal_pending = false; // Try someone else next iteration
+                    break;
+                }
+
+                case TAG_TOKEN: {
+                    if (rank == 0) {
+                        int in_color = rbuf[0];
+                        if (in_color == WHITE && is_idle) {
+                            // TOKEN SURVIVED A FULL LAP WHILE CLEAN. WE ARE DONE!
+                            int d = 0;
+                            for (int r = 1; r < P; r++) {
+                                MPI_Send(&d, 1, MPI_INT, r, TAG_TERMINATE, MPI_COMM_WORLD);
+                            }
+                            done = true;
+                        } else {
+                            // Token got dirty. Generate a new clean one.
+                            has_token = true;
+                            token_color = WHITE;
+                        }
+                    } else {
+                        has_token = true;
+                        token_color = rbuf[0];
+                    }
+                    break;
+                }
+
+                case TAG_TERMINATE: {
+                    done = true;
+                    break;
+                }
             }
-            else if (tag == TAG_WORK && wait_master) {
-                local.push(unpackSub(rbuf.data()));
-                wait_master = false;
-            }
-            else if (tag == TAG_NO_MORE && wait_master) {
-                done = true;
-                wait_master = false;
-            }
-        }
+        } // End of message polling
 
         if (done) break;
-        if (wait_master) continue;
 
+        // ── 2. Work Stealing Logic (If Idle) ───────────────────────────────
         if (local.empty()) {
-            int d = 0;
-            MPI_Send(&d, 1, MPI_INT, 0, TAG_WORK_REQ, MPI_COMM_WORLD);
-            wait_master = true;
-            continue;
+            is_idle = true;
+            passToken(); // Pass token forward if we hold it
+
+            if (!steal_pending && P > 1) {
+                int target;
+                do { target = rand() % P; } while (target == rank);
+                int d = 0;
+                MPI_Send(&d, 1, MPI_INT, target, TAG_STEAL_REQ, MPI_COMM_WORLD);
+                steal_pending = true;
+            }
+            continue; // Wait for messages
         }
 
+        // ── 3. Compute (If Active) ─────────────────────────────────────────
         Sub sp = local.top(); local.pop();
         int prev = g_pmax;
+        
         expand(sp, local);
 
+        // If we found a new P_max, broadcast it to EVERYONE
         if (g_pmax > prev) {
-            MPI_Send(&g_pmax, 1, MPI_INT, 0, TAG_NEW_BEST, MPI_COMM_WORLD);
+            for (int r = 0; r < P; r++) {
+                if (r != rank) {
+                    MPI_Send(&g_pmax, 1, MPI_INT, r, TAG_NEW_BEST, MPI_COMM_WORLD);
+                }
+            }
         }
     }
 
-    sendResult();
+    // ── 4. Final Aggregation (Rank 0 prints) ───────────────────────────────
+    
+    // BUGFIX: Calculate the ACTUAL profit of this rank's specific g_best array,
+    // rather than relying on the shared g_pmax pruning bound.
+    int actual_local_profit = 0;
+    for (int v : g_best) actual_local_profit += profit[v];
+
+    // Send final local results to Rank 0 to ensure absolute maximum is printed
+    if (rank != 0) {
+        vector<int> b;
+        b.push_back(actual_local_profit); // Send actual verified profit
+        b.push_back((int)g_best.size());
+        for (int v : g_best) b.push_back(v);
+        MPI_Send(b.data(), b.size(), MPI_INT, 0, 999 /* Final Result Tag */, MPI_COMM_WORLD);
+    } 
+    else {
+        // Rank 0 collects
+        for (int r = 1; r < P; r++) {
+            MPI_Status st;
+            MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, r, 999, MPI_COMM_WORLD, &st);
+            int lp = rbuf[0];
+            
+            // Compare against Rank 0's actual verified profit
+            if (lp > actual_local_profit) {
+                actual_local_profit = lp;
+                g_best.clear();
+                int csz = rbuf[1];
+                for (int i = 0; i < csz; i++) g_best.push_back(rbuf[2 + i]);
+            }
+        }
+
+        // Print final result
+        sort(g_best.begin(), g_best.end());
+        ofstream fout(out_filename);
+        if (!fout.is_open()) {
+            cerr << "Error: Could not open output file " << out_filename << "\n";
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        
+        // Print the verified maximum profit
+        fout << actual_local_profit << "\n"; 
+        for (int i = 0; i < (int)g_best.size(); i++) {
+            if (i) fout << " ";
+            fout << g_best[i];
+        }
+        fout << "\n";
+        fout.close();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -404,12 +386,10 @@ static void runSequential(const char* out_filename) {
     Sub root;
     root.cand.resize(N);
     iota(root.cand.begin(), root.cand.end(), 0);
-    
     sort(root.cand.begin(), root.cand.end(), [](int a, int b){
         if (profit[a] != profit[b]) return profit[a] > profit[b];
         return a < b;
     });
-    
     stk.push(root);
     
     while (!stk.empty()) {
@@ -418,13 +398,11 @@ static void runSequential(const char* out_filename) {
     }
     
     sort(g_best.begin(), g_best.end());
-    
     ofstream fout(out_filename);
     if (!fout.is_open()) {
         cerr << "Error: Could not open output file " << out_filename << "\n";
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
     fout << g_pmax << "\n";
     for (int i = 0; i < (int)g_best.size(); i++) {
         if (i) fout << " ";
@@ -489,10 +467,8 @@ int main(int argc, char** argv) {
 
     if (P == 1) {
         runSequential(argv[2]);
-    } else if (rank == 0) {
-        runMaster(P, argv[2]);
     } else {
-        runWorker(rank, P);
+        runDecentralized(rank, P, argv[2]);
     }
 
     MPI_Finalize();

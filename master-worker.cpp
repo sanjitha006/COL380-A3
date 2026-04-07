@@ -240,8 +240,12 @@ static void runMaster(int P, const char* out_filename) {
 
     deque<Sub> Q = rootDecompose(W * 8); 
 
-    int global_best_p = g_pmax;
-    vector<int> global_best_c = g_best;
+    int global_best_p = g_pmax; // Used ONLY for broadcasting bounds
+    
+    // BUGFIX: Separate the pruning bound from the actual verified clique
+    int verified_best_p = 0;
+    for (int v : g_best) verified_best_p += profit[v];
+    vector<int> verified_best_c = g_best;
 
     vector<bool> is_idle(P, false);
     vector<bool> terminated(P, false);
@@ -298,18 +302,19 @@ static void runMaster(int P, const char* out_filename) {
         }
         else if (tag == TAG_RESULT) {
             int lp = rbuf[0];
-            if (lp > global_best_p) {
-                global_best_p = lp;
-                global_best_c.clear();
+            // BUGFIX: Compare against the VERIFIED profit, not the pruning bound
+            if (lp > verified_best_p) {
+                verified_best_p = lp;
+                verified_best_c.clear();
                 int csz = rbuf[1];
-                for (int i = 0; i < csz; i++) global_best_c.push_back(rbuf[2 + i]);
+                for (int i = 0; i < csz; i++) verified_best_c.push_back(rbuf[2 + i]);
             }
             terminated[src] = true;
             done_count++;
         }
     }
 
-    sort(global_best_c.begin(), global_best_c.end());
+    sort(verified_best_c.begin(), verified_best_c.end());
     
     ofstream fout(out_filename);
     if (!fout.is_open()) {
@@ -317,15 +322,15 @@ static void runMaster(int P, const char* out_filename) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     
-    fout << global_best_p << "\n";
-    for (int i = 0; i < (int)global_best_c.size(); i++) {
+    // Print the verified maximum profit and its array
+    fout << verified_best_p << "\n";
+    for (int i = 0; i < (int)verified_best_c.size(); i++) {
         if (i) fout << " ";
-        fout << global_best_c[i];
+        fout << verified_best_c[i];
     }
     fout << "\n";
     fout.close();
 }
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  WORKER — ranks 1 … P-1
 // ═══════════════════════════════════════════════════════════════════════════
@@ -337,9 +342,13 @@ static void runWorker(int rank, int P) {
     bool wait_master = false;
     bool done        = false;
 
-    auto sendResult = [&]() {
+   auto sendResult = [&]() {
+        // BUGFIX: Calculate actual profit of g_best
+        int actual_local_profit = 0;
+        for (int v : g_best) actual_local_profit += profit[v];
+
         vector<int> b;
-        b.push_back(g_pmax);
+        b.push_back(actual_local_profit);
         b.push_back((int)g_best.size());
         for (int v : g_best) b.push_back(v);
         MPI_Send(b.data(), (int)b.size(), MPI_INT, 0, TAG_RESULT, MPI_COMM_WORLD);

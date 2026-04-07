@@ -1,7 +1,7 @@
 # Makefile for Budgeted Maximum Clique — Sequential and MPI versions
 CXX     = g++
 MPICXX  = mpicxx
-CFLAGS  = -O2 -std=c++17
+CFLAGS  = -O3 -std=c++17
 
 all: compile_seq compile_mpi run_seq run_mpi
 
@@ -9,13 +9,12 @@ compile_seq: seq.cpp
 	$(CXX) $(CFLAGS) -o clique_seq seq.cpp
 
 compile_mpi: test.cpp
-	$(MPICXX) $(CFLAGS) -o clique_mpi test.cpp
+	$(MPICXX) $(CFLAGS) -o clique_mpi claude.cpp
 
 run_seq: clique_seq
-	./clique_seq input1.txt output1_seq.txt
+	time ./clique_seq tainput.txt taoutput_seq.txt
 
 run_mpi: clique_mpi
-	mpirun -n 4 ./clique_mpi input1.txt output1_mpi.txt
-
+	time mpirun -x UCX_LOG_LEVEL=error -n 4 ./clique_mpi tainput.txt taoutput_mpi.txt
 clean:
 	rm -f clique_seq clique_mpi

@@ -27,9 +27,6 @@ Ranks 1…P−1:
 
 
 
-
-     //see how the communication works..first  ecplain the communication
-     idea: each has its own problem stack...now others broadcast when need work and these stacks when they keep on look for such broadcas
-     msg find this and send the problem in stack and reveive stuff from that process??
-     why need master to coordinate? master can also work,these guya can cooedinate..
-     
+//develop testcases,test them-presnt 2 codes
+//loook more into the logic see code and improve wrt tc
+//finally at some point write your code.
