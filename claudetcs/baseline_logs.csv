@@ -1,0 +1,11 @@
+TC_Name,Seq_Time_Sec,Optimal_Profit
+01_tight_s.txt,0.9958,765
+02_tight_m.txt,8.0286,901
+03_dense_s.txt,15.2695,879
+04_dense_m.txt,78.8609,1025
+05_ta_clone.txt,245.2871,1158
+06_hard_500.txt,722.1194,1094
+07_hard_600.txt,1238.1671,1148
+08_stress_a.txt,24.1500,998
+09_stress_b.txt,41.0000,945
+10_ultra.txt,43.0805,1014

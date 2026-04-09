@@ -141,7 +141,8 @@ static int knapsackBound(const vector<int>& cand, int rem) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  expand() 
 // ═══════════════════════════════════════════════════════════════════════════
-static void expand(const Sub& sp, stack<Sub>& stk) {
+// Change stack<Sub>& to deque<Sub>&
+static void expand(const Sub& sp, deque<Sub>& stk) {
     if (sp.P + colorBound(sp.cand) <= g_pmax) return;
     if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) return;
 
@@ -167,20 +168,68 @@ static void expand(const Sub& sp, stack<Sub>& stk) {
         for (int j = i + 1; j < n; j++) {
             if (edge(v, sp.cand[j])) child.cand.push_back(sp.cand[j]);
         }
-        stk.push(move(child));
+        // Change from push() to push_back()
+        stk.push_back(move(child));
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  rootDecompose() — used for initial Static Scatter
+// ═══════════════════════════════════════════════════════════════════════════
+static deque<Sub> rootDecompose(int target) {
+    deque<Sub> q;
+    Sub root;
+    root.cand.resize(N);
+    iota(root.cand.begin(), root.cand.end(), 0);
+    sort(root.cand.begin(), root.cand.end(), [](int a, int b){
+        if (profit[a] != profit[b]) return profit[a] > profit[b];
+        return a < b;
+    });
+    q.push_back(root);
+
+    while ((int)q.size() < target && !q.empty()) {
+        auto it = max_element(q.begin(), q.end(), [](const Sub& a, const Sub& b){
+            return a.cand.size() < b.cand.size();
+        });
+        Sub sp = *it; q.erase(it);
+        if (sp.cand.empty()) { q.push_back(sp); break; }
+
+        if (sp.P + colorBound(sp.cand) <= g_pmax) continue;
+        if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) continue;
+
+        int v = sp.cand[0];
+
+        // Branch 1 : WITHOUT v
+        Sub without = sp;
+        without.cand.erase(without.cand.begin()); 
+        if (!without.cand.empty()) q.push_back(without);
+
+        // Branch 2 : WITH v
+        if (sp.W + cost[v] <= B) {
+            Sub with_v;
+            with_v.P = sp.P + profit[v];
+            with_v.W = sp.W + cost[v];
+            with_v.clique = sp.clique;
+            with_v.clique.push_back(v);
+            for (size_t i = 1; i < sp.cand.size(); i++) {
+                if (edge(v, sp.cand[i])) with_v.cand.push_back(sp.cand[i]);
+            }
+            if (with_v.P > g_pmax) { g_pmax = with_v.P; g_best = with_v.clique; }
+            q.push_back(with_v);
+        }
+    }
+    return q;
+}
 // ═══════════════════════════════════════════════════════════════════════════
 //  Decentralized Compute Engine
 // ═══════════════════════════════════════════════════════════════════════════
 static void runDecentralized(int rank, int P, const char* out_filename) {
     const int RBUF_SZ = 1 << 20; // 1MB receive buffer
     vector<int> rbuf(RBUF_SZ);
-    stack<Sub> local;
-
+    //stack<Sub> local;
+    deque<Sub> local;
     // --- State Variables ---
-    bool is_idle = (rank != 0); // Rank 0 starts busy, others start idle
+    bool is_idle = false; // We assume everyone gets a piece to start!
     bool done = false;
     bool steal_pending = false;
     
@@ -192,17 +241,55 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
     // Seed Random generator for random work stealing
     srand(time(NULL) + rank);
 
-    // Rank 0 puts the root node onto its stack
+    // ── THE KICKSTART (Static Initial Scatter) ─────────────────────────────
     if (rank == 0) {
-        Sub root;
-        root.cand.resize(N);
-        iota(root.cand.begin(), root.cand.end(), 0);
-        sort(root.cand.begin(), root.cand.end(), [](int a, int b){
-            if (profit[a] != profit[b]) return profit[a] > profit[b];
-            return a < b;
-        });
-        local.push(root);
+        // Break the root into at least P subproblems
+       // deque<Sub> initial_chunks = rootDecompose(P);
+        const int CHUNK_MULTIPLIER = 4; // Tweak this! (Try 4, 8, 16)
+        deque<Sub> initial_chunks = rootDecompose(P * CHUNK_MULTIPLIER);
+        // Keep one for Rank 0 (if valid)
+        if (!initial_chunks.empty()) {
+            local.push_back(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        // Deal the rest out to Ranks 1 through P-1
+        int target_rank = 1;
+        while (!initial_chunks.empty() && target_rank < P) {
+            auto sbuf = packSub(initial_chunks.front());
+            initial_chunks.pop_front();
+            MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, target_rank, TAG_WORK, MPI_COMM_WORLD);
+            target_rank++;
+        }
+        
+        // Safety net: If the tree was too small to give everyone a piece, tell the rest they are idle
+        while (target_rank < P) {
+            int empty_sig = 0;
+            MPI_Send(&empty_sig, 1, MPI_INT, target_rank, TAG_NACK, MPI_COMM_WORLD);
+            target_rank++;
+        }
+        
+        // If we still have leftovers (because the tree split weirdly), keep them on Rank 0
+        while (!initial_chunks.empty()) {
+            local.push_back(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        // If Rank 0 ended up with nothing (extremely rare), mark idle
+        if (local.empty()) is_idle = true;
+    } 
+    else {
+        // Workers wait patiently for their initial starting chunk from Rank 0
+        MPI_Status st;
+        MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+        
+        if (st.MPI_TAG == TAG_WORK) {
+            local.push_back(unpackSub(rbuf.data()));
+        } else {
+            is_idle = true; // Tree was too small, didn't get a chunk
+        }
     }
+    // ───────────────────────────────────────────────────────────────────────
 
     auto passToken = [&]() {
         if (has_token && is_idle) {
@@ -235,31 +322,35 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
                 }
                 
                 case TAG_STEAL_REQ: {
-                    // Someone wants work. Do we have enough to share?
-                    if (local.size() >= 2) {
-                        int half = local.size() / 2;
-                        vector<Sub> donated;
-                        for (int i = 0; i < half; i++) {
-                            donated.push_back(local.top());
-                            local.pop();
+                        if (local.size() >= 2) {
+                            int half = local.size() / 2;
+                            vector<Sub> donated;
+                            
+                            // ── THE FIX: Steal from the FRONT of the deque ──
+                            // This gives away the massive, shallow branches!
+                            for (int i = 0; i < half; i++) {
+                                donated.push_back(local.front());
+                                local.pop_front();
+                            }
+                            
+                            auto sbuf = packBatch(donated);
+                            MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
+                            my_color = BLACK; 
+                        } else {
+                            int d = 0;
+                            MPI_Send(&d, 1, MPI_INT, src, TAG_NACK, MPI_COMM_WORLD);
                         }
-                        auto sbuf = packBatch(donated);
-                        MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
-                        my_color = BLACK; // Sent work -> become Dirty
-                    } else {
-                        int d = 0;
-                        MPI_Send(&d, 1, MPI_INT, src, TAG_NACK, MPI_COMM_WORLD);
+                        break;
                     }
-                    break;
-                }
 
-                case TAG_WORK: {
-                    auto subs = unpackBatch(rbuf.data());
-                    for (auto& s : subs) local.push(move(s));
-                    steal_pending = false;
-                    is_idle = false;
-                    break;
-                }
+                    case TAG_WORK: {
+                        auto subs = unpackBatch(rbuf.data());
+                        // Push stolen work to the BACK
+                        for (auto& s : subs) local.push_back(move(s));
+                        steal_pending = false;
+                        is_idle = false;
+                        break;
+                    }
 
                 case TAG_NACK: {
                     steal_pending = false; // Try someone else next iteration
@@ -312,12 +403,11 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
             continue; // Wait for messages
         }
 
-        // ── 3. Compute (If Active) ─────────────────────────────────────────
-        Sub sp = local.top(); local.pop();
-        int prev = g_pmax;
+        Sub sp = local.back(); 
+        local.pop_back();
         
+        int prev = g_pmax;
         expand(sp, local);
-
         // If we found a new P_max, broadcast it to EVERYONE
         if (g_pmax > prev) {
             for (int r = 0; r < P; r++) {
@@ -382,7 +472,7 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
 //  Sequential fallback (P == 1)
 // ═══════════════════════════════════════════════════════════════════════════
 static void runSequential(const char* out_filename) {
-    stack<Sub> stk;
+    deque<Sub> stk; // Changed from stack
     Sub root;
     root.cand.resize(N);
     iota(root.cand.begin(), root.cand.end(), 0);
@@ -390,10 +480,10 @@ static void runSequential(const char* out_filename) {
         if (profit[a] != profit[b]) return profit[a] > profit[b];
         return a < b;
     });
-    stk.push(root);
+    stk.push_back(root); // Changed from push
     
     while (!stk.empty()) {
-        Sub sp = stk.top(); stk.pop();
+        Sub sp = stk.back(); stk.pop_back(); // Changed from top() and pop()
         expand(sp, stk);
     }
     

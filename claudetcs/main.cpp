@@ -172,6 +172,53 @@ static void expand(const Sub& sp, stack<Sub>& stk) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  rootDecompose() — used for initial Static Scatter
+// ═══════════════════════════════════════════════════════════════════════════
+static deque<Sub> rootDecompose(int target) {
+    deque<Sub> q;
+    Sub root;
+    root.cand.resize(N);
+    iota(root.cand.begin(), root.cand.end(), 0);
+    sort(root.cand.begin(), root.cand.end(), [](int a, int b){
+        if (profit[a] != profit[b]) return profit[a] > profit[b];
+        return a < b;
+    });
+    q.push_back(root);
+
+    while ((int)q.size() < target && !q.empty()) {
+        auto it = max_element(q.begin(), q.end(), [](const Sub& a, const Sub& b){
+            return a.cand.size() < b.cand.size();
+        });
+        Sub sp = *it; q.erase(it);
+        if (sp.cand.empty()) { q.push_back(sp); break; }
+
+        if (sp.P + colorBound(sp.cand) <= g_pmax) continue;
+        if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) continue;
+
+        int v = sp.cand[0];
+
+        // Branch 1 : WITHOUT v
+        Sub without = sp;
+        without.cand.erase(without.cand.begin()); 
+        if (!without.cand.empty()) q.push_back(without);
+
+        // Branch 2 : WITH v
+        if (sp.W + cost[v] <= B) {
+            Sub with_v;
+            with_v.P = sp.P + profit[v];
+            with_v.W = sp.W + cost[v];
+            with_v.clique = sp.clique;
+            with_v.clique.push_back(v);
+            for (size_t i = 1; i < sp.cand.size(); i++) {
+                if (edge(v, sp.cand[i])) with_v.cand.push_back(sp.cand[i]);
+            }
+            if (with_v.P > g_pmax) { g_pmax = with_v.P; g_best = with_v.clique; }
+            q.push_back(with_v);
+        }
+    }
+    return q;
+}
+// ═══════════════════════════════════════════════════════════════════════════
 //  Decentralized Compute Engine
 // ═══════════════════════════════════════════════════════════════════════════
 static void runDecentralized(int rank, int P, const char* out_filename) {
@@ -180,7 +227,7 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
     stack<Sub> local;
 
     // --- State Variables ---
-    bool is_idle = (rank != 0); // Rank 0 starts busy, others start idle
+    bool is_idle = false; // We assume everyone gets a piece to start!
     bool done = false;
     bool steal_pending = false;
     
@@ -192,17 +239,54 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
     // Seed Random generator for random work stealing
     srand(time(NULL) + rank);
 
-    // Rank 0 puts the root node onto its stack
+    // ── THE KICKSTART (Static Initial Scatter) ─────────────────────────────
     if (rank == 0) {
-        Sub root;
-        root.cand.resize(N);
-        iota(root.cand.begin(), root.cand.end(), 0);
-        sort(root.cand.begin(), root.cand.end(), [](int a, int b){
-            if (profit[a] != profit[b]) return profit[a] > profit[b];
-            return a < b;
-        });
-        local.push(root);
+        // Break the root into at least P subproblems
+        deque<Sub> initial_chunks = rootDecompose(P);
+        
+        // Keep one for Rank 0 (if valid)
+        if (!initial_chunks.empty()) {
+            local.push(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        // Deal the rest out to Ranks 1 through P-1
+        int target_rank = 1;
+        while (!initial_chunks.empty() && target_rank < P) {
+            auto sbuf = packSub(initial_chunks.front());
+            initial_chunks.pop_front();
+            MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, target_rank, TAG_WORK, MPI_COMM_WORLD);
+            target_rank++;
+        }
+        
+        // Safety net: If the tree was too small to give everyone a piece, tell the rest they are idle
+        while (target_rank < P) {
+            int empty_sig = 0;
+            MPI_Send(&empty_sig, 1, MPI_INT, target_rank, TAG_NACK, MPI_COMM_WORLD);
+            target_rank++;
+        }
+        
+        // If we still have leftovers (because the tree split weirdly), keep them on Rank 0
+        while (!initial_chunks.empty()) {
+            local.push(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        // If Rank 0 ended up with nothing (extremely rare), mark idle
+        if (local.empty()) is_idle = true;
+    } 
+    else {
+        // Workers wait patiently for their initial starting chunk from Rank 0
+        MPI_Status st;
+        MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+        
+        if (st.MPI_TAG == TAG_WORK) {
+            local.push(unpackSub(rbuf.data()));
+        } else {
+            is_idle = true; // Tree was too small, didn't get a chunk
+        }
     }
+    // ───────────────────────────────────────────────────────────────────────
 
     auto passToken = [&]() {
         if (has_token && is_idle) {

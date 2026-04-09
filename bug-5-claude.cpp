@@ -141,7 +141,7 @@ static int knapsackBound(const vector<int>& cand, int rem) {
 // ═══════════════════════════════════════════════════════════════════════════
 //  expand() 
 // ═══════════════════════════════════════════════════════════════════════════
-static void expand(const Sub& sp, stack<Sub>& stk) {
+static void expand(const Sub& sp, deque<Sub>& stk) {
     if (sp.P + colorBound(sp.cand) <= g_pmax) return;
     if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) return;
 
@@ -167,141 +167,288 @@ static void expand(const Sub& sp, stack<Sub>& stk) {
         for (int j = i + 1; j < n; j++) {
             if (edge(v, sp.cand[j])) child.cand.push_back(sp.cand[j]);
         }
-        stk.push(move(child));
+        stk.push_back(move(child));
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Decentralized Compute Engine
+//  rootDecompose() — used for initial Static Scatter
+// ═══════════════════════════════════════════════════════════════════════════
+static deque<Sub> rootDecompose(int target) {
+    deque<Sub> q;
+    Sub root;
+    root.cand.resize(N);
+    iota(root.cand.begin(), root.cand.end(), 0);
+    sort(root.cand.begin(), root.cand.end(), [](int a, int b){
+        if (profit[a] != profit[b]) return profit[a] > profit[b];
+        return a < b;
+    });
+    q.push_back(root);
+
+    while ((int)q.size() < target && !q.empty()) {
+        auto it = max_element(q.begin(), q.end(), [](const Sub& a, const Sub& b){
+            return a.cand.size() < b.cand.size();
+        });
+        Sub sp = *it; q.erase(it);
+        if (sp.cand.empty()) { q.push_back(sp); break; }
+
+        if (sp.P + colorBound(sp.cand) <= g_pmax) continue;
+        if (sp.P + knapsackBound(sp.cand, B - sp.W) <= g_pmax) continue;
+
+        int v = sp.cand[0];
+
+        // Branch 1 : WITHOUT v
+        Sub without = sp;
+        without.cand.erase(without.cand.begin()); 
+        if (!without.cand.empty()) q.push_back(without);
+
+        // Branch 2 : WITH v
+        if (sp.W + cost[v] <= B) {
+            Sub with_v;
+            with_v.P = sp.P + profit[v];
+            with_v.W = sp.W + cost[v];
+            with_v.clique = sp.clique;
+            with_v.clique.push_back(v);
+            for (size_t i = 1; i < sp.cand.size(); i++) {
+                if (edge(v, sp.cand[i])) with_v.cand.push_back(sp.cand[i]);
+            }
+            if (with_v.P > g_pmax) { g_pmax = with_v.P; g_best = with_v.clique; }
+            q.push_back(with_v);
+        }
+    }
+    return q;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Decentralized Compute Engine (Final Armored Version)
 // ═══════════════════════════════════════════════════════════════════════════
 static void runDecentralized(int rank, int P, const char* out_filename) {
-    const int RBUF_SZ = 1 << 20; // 1MB receive buffer
-    vector<int> rbuf(RBUF_SZ);
-    stack<Sub> local;
-
+    vector<int> rbuf; 
+    deque<Sub> local;
+    
+    // --- SAFE ASYNC MEMORY: Persistent buffers and requests for MPI_Isend ---
+    vector<vector<int>> init_sbufs(P);
+    vector<MPI_Request> init_reqs(P, MPI_REQUEST_NULL);
+    
     // --- State Variables ---
-    bool is_idle = (rank != 0); // Rank 0 starts busy, others start idle
+    bool is_idle = false; 
     bool done = false;
     bool steal_pending = false;
     
     // --- Dijkstra Token Variables ---
     int  my_color = WHITE;
-    bool has_token = (rank == 0); // Rank 0 initiates the token
+    bool has_token = (rank == 0);
     int  token_color = WHITE;
 
-    // Seed Random generator for random work stealing
+    int poll_counter = 0;
+    const int POLL_FREQ = 1024;
+
     srand(time(NULL) + rank);
 
-    // Rank 0 puts the root node onto its stack
+    // ── 1. THE DECOMPOSITION PHASE ─────────────────────────────────────────
+    deque<Sub> initial_chunks;
     if (rank == 0) {
-        Sub root;
-        root.cand.resize(N);
-        iota(root.cand.begin(), root.cand.end(), 0);
-        sort(root.cand.begin(), root.cand.end(), [](int a, int b){
-            if (profit[a] != profit[b]) return profit[a] > profit[b];
-            return a < b;
-        });
-        local.push(root);
+        const int CHUNK_MULTIPLIER = 4;
+        initial_chunks = rootDecompose(P * CHUNK_MULTIPLIER);
     }
 
+    // BUGFIX 4: SYNC THE IMPROVED BOUND
+    MPI_Bcast(&g_pmax, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // ── 2. THE KICKSTART (Asynchronous Non-Blocking Scatter) ───────────────
+    if (rank == 0) {
+        if (!initial_chunks.empty()) {
+            local.push_back(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        int target_rank = 1;
+        while (!initial_chunks.empty() && target_rank < P) {
+            vector<Sub> init_batch;
+            init_batch.push_back(initial_chunks.front());
+            initial_chunks.pop_front();
+            
+            init_sbufs[target_rank] = packBatch(init_batch);
+            MPI_Isend(init_sbufs[target_rank].data(), (int)init_sbufs[target_rank].size(), 
+                      MPI_INT, target_rank, TAG_WORK, MPI_COMM_WORLD, &init_reqs[target_rank]);
+            target_rank++;
+        }
+        
+        while (target_rank < P) {
+            init_sbufs[target_rank] = {0}; 
+            MPI_Isend(init_sbufs[target_rank].data(), 1, MPI_INT, target_rank, 
+                      TAG_NACK, MPI_COMM_WORLD, &init_reqs[target_rank]);
+            target_rank++;
+        }
+        
+        while (!initial_chunks.empty()) {
+            local.push_back(initial_chunks.front());
+            initial_chunks.pop_front();
+        }
+        
+        if (local.empty()) is_idle = true;
+    } 
+    else {
+        MPI_Status st;
+        MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+        int cnt; MPI_Get_count(&st, MPI_INT, &cnt);
+        // BUGFIX D: cast cnt to size_t to avoid signed/unsigned comparison warning
+        if ((size_t)cnt > rbuf.size()) rbuf.resize((size_t)cnt);
+        
+        MPI_Recv(rbuf.data(), cnt, MPI_INT, 0, MPI_ANY_TAG, MPI_COMM_WORLD, &st);
+        
+        if (st.MPI_TAG == TAG_WORK) {
+            auto subs = unpackBatch(rbuf.data()); 
+            for (auto& s : subs) local.push_back(move(s));
+        } else {
+            is_idle = true; 
+        }
+    }
+
+    // ── BUGFIX A: Wait for Isends to complete BEFORE entering main loop ────
+    // This MUST happen before the aggregation MPI_Recv to avoid deadlock:
+    // winner rank sends tag 999 only after done=true; rank 0 must not be
+    // blocked waiting on Isend buffers at that point.
+    if (rank == 0) {
+        MPI_Waitall(P - 1, init_reqs.data() + 1, MPI_STATUSES_IGNORE);
+    }
+    // ───────────────────────────────────────────────────────────────────────
+
+    // BUGFIX B: passToken must respect is_idle for correctness of Dijkstra.
+    // An active rank (is_idle==false) must mark the token BLACK before
+    // forwarding — it may have sent work to other ranks since last receiving
+    // the token, so a WHITE pass would allow false termination detection.
     auto passToken = [&]() {
-        if (has_token && is_idle) {
-            int out_token = (token_color == BLACK || my_color == BLACK) ? BLACK : WHITE;
+        if (has_token) {
+            // If we are still active, we taint the token BLACK regardless of
+            // my_color, because work may still be in flight from this rank.
+            int out_token;
+            if (!is_idle) {
+                out_token = BLACK;           // active rank always taints
+            } else {
+                // Idle: pass accumulated color (BLACK if we sent work since
+                // receiving the token, WHITE if we have been clean).
+                out_token = (token_color == BLACK || my_color == BLACK) ? BLACK : WHITE;
+            }
             int next_rank = (rank + 1) % P;
             MPI_Send(&out_token, 1, MPI_INT, next_rank, TAG_TOKEN, MPI_COMM_WORLD);
-            my_color = WHITE; // Become clean again after passing
+            my_color = WHITE; 
             has_token = false;
         }
     };
 
     while (!done) {
-        // ── 1. Non-blocking Message Poll ──────────────────────────────────
-        for (;;) {
-            int flag = 0;
-            MPI_Status st;
-            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &st);
-            if (!flag) break; // Inbox empty
+        // ── 3. Throttled Message Poll ──────────────────────────────────────
+        if (is_idle || (++poll_counter % POLL_FREQ == 0)) {
+            for (;;) {
+                int flag = 0;
+                MPI_Status st;
+                MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &st);
+                if (!flag) break;
 
-            int src = st.MPI_SOURCE;
-            int tag = st.MPI_TAG;
-            int cnt; MPI_Get_count(&st, MPI_INT, &cnt);
-            MPI_Recv(rbuf.data(), cnt, MPI_INT, src, tag, MPI_COMM_WORLD, &st);
-
-            switch (tag) {
-                case TAG_NEW_BEST: {
-                    int np = rbuf[0];
-                    if (np > g_pmax) g_pmax = np;
-                    break;
-                }
+                int src = st.MPI_SOURCE;
+                int tag = st.MPI_TAG;
                 
-                case TAG_STEAL_REQ: {
-                    // Someone wants work. Do we have enough to share?
-                    if (local.size() >= 2) {
-                        int half = local.size() / 2;
-                        vector<Sub> donated;
-                        for (int i = 0; i < half; i++) {
-                            donated.push_back(local.top());
-                            local.pop();
-                        }
-                        auto sbuf = packBatch(donated);
-                        MPI_Send(sbuf.data(), sbuf.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
-                        my_color = BLACK; // Sent work -> become Dirty
-                    } else {
-                        int d = 0;
-                        MPI_Send(&d, 1, MPI_INT, src, TAG_NACK, MPI_COMM_WORLD);
+                // BUGFIX D: cast to size_t for safe comparison
+                int cnt; MPI_Get_count(&st, MPI_INT, &cnt);
+                if ((size_t)cnt > rbuf.size()) rbuf.resize((size_t)cnt);
+                
+                MPI_Recv(rbuf.data(), cnt, MPI_INT, src, tag, MPI_COMM_WORLD, &st);
+
+                switch (tag) {
+                    case TAG_NEW_BEST: {
+                        int np = rbuf[0];
+                        if (np > g_pmax) g_pmax = np;
+                        break;
                     }
-                    break;
-                }
-
-                case TAG_WORK: {
-                    auto subs = unpackBatch(rbuf.data());
-                    for (auto& s : subs) local.push(move(s));
-                    steal_pending = false;
-                    is_idle = false;
-                    break;
-                }
-
-                case TAG_NACK: {
-                    steal_pending = false; // Try someone else next iteration
-                    break;
-                }
-
-                case TAG_TOKEN: {
-                    if (rank == 0) {
-                        int in_color = rbuf[0];
-                        if (in_color == WHITE && is_idle) {
-                            // TOKEN SURVIVED A FULL LAP WHILE CLEAN. WE ARE DONE!
-                            int d = 0;
-                            for (int r = 1; r < P; r++) {
-                                MPI_Send(&d, 1, MPI_INT, r, TAG_TERMINATE, MPI_COMM_WORLD);
+                    
+                    case TAG_STEAL_REQ: {
+                        if (local.size() >= 2) {
+                            int half = (int)local.size() / 2;
+                            vector<Sub> donated;
+                            for (int i = 0; i < half; i++) {
+                                donated.push_back(local.front());
+                                local.pop_front();
                             }
-                            done = true;
+                            auto sbuf = packBatch(donated);
+                            MPI_Send(sbuf.data(), (int)sbuf.size(), MPI_INT, src, TAG_WORK, MPI_COMM_WORLD);
+                            my_color = BLACK;
                         } else {
-                            // Token got dirty. Generate a new clean one.
-                            has_token = true;
-                            token_color = WHITE;
+                            int d = 0;
+                            MPI_Send(&d, 1, MPI_INT, src, TAG_NACK, MPI_COMM_WORLD);
                         }
-                    } else {
-                        has_token = true;
-                        token_color = rbuf[0];
+                        break;
                     }
-                    break;
-                }
 
-                case TAG_TERMINATE: {
-                    done = true;
-                    break;
+                    case TAG_WORK: {
+                        auto subs = unpackBatch(rbuf.data());
+                        for (auto& s : subs) local.push_back(move(s));
+                        steal_pending = false;
+                        is_idle = false;
+                        break;
+                    }
+
+                    case TAG_NACK: {
+                        steal_pending = false;
+                        break;
+                    }
+
+                    case TAG_TOKEN: {
+                        if (rank == 0) {
+                            int in_color = rbuf[0];
+                            if (in_color == WHITE && is_idle) {
+                                int d = 0;
+                                for (int r = 1; r < P; r++) {
+                                    MPI_Send(&d, 1, MPI_INT, r, TAG_TERMINATE, MPI_COMM_WORLD);
+                                }
+                                done = true;
+                            } else {
+                                has_token = true;
+                                token_color = WHITE;
+                            }
+                        } else {
+                            has_token = true;
+                            token_color = rbuf[0];
+                        }
+                        break;
+                    }
+
+                    case TAG_TERMINATE: {
+                        // BUGFIX C: drain any pending steal reply before exiting.
+                        // If we sent a TAG_STEAL_REQ and haven't received the
+                        // reply yet, the peer is blocked in MPI_Send waiting for
+                        // us to receive. We must consume that message now.
+                        if (steal_pending) {
+                            MPI_Status drain_st;
+                            // Probe first so we don't block if it hasn't arrived yet
+                            int dflag = 0;
+                            MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &dflag, &drain_st);
+                            if (dflag) {
+                                int dcnt; MPI_Get_count(&drain_st, MPI_INT, &dcnt);
+                                if ((size_t)dcnt > rbuf.size()) rbuf.resize((size_t)dcnt);
+                                MPI_Recv(rbuf.data(), dcnt, MPI_INT,
+                                         drain_st.MPI_SOURCE, drain_st.MPI_TAG,
+                                         MPI_COMM_WORLD, &drain_st);
+                            }
+                            steal_pending = false;
+                        }
+                        done = true;
+                        break;
+                    }
                 }
             }
-        } // End of message polling
+        }
 
         if (done) break;
 
-        // ── 2. Work Stealing Logic (If Idle) ───────────────────────────────
+        // ── 4. Token Ring (Pass immediately to prevent stalling) ───────────
         if (local.empty()) {
             is_idle = true;
-            passToken(); // Pass token forward if we hold it
+        }
+        passToken();
 
+        // ── 5. Work Stealing Logic (If Idle) ───────────────────────────────
+        if (is_idle) {
             if (!steal_pending && P > 1) {
                 int target;
                 do { target = rand() % P; } while (target == rank);
@@ -309,16 +456,16 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
                 MPI_Send(&d, 1, MPI_INT, target, TAG_STEAL_REQ, MPI_COMM_WORLD);
                 steal_pending = true;
             }
-            continue; // Wait for messages
+            continue; 
         }
 
-        // ── 3. Compute (If Active) ─────────────────────────────────────────
-        Sub sp = local.top(); local.pop();
-        int prev = g_pmax;
+        // ── 6. Compute (If Active) ─────────────────────────────────────────
+        Sub sp = local.back(); 
+        local.pop_back();
         
+        int prev = g_pmax;
         expand(sp, local);
-
-        // If we found a new P_max, broadcast it to EVERYONE
+        
         if (g_pmax > prev) {
             for (int r = 0; r < P; r++) {
                 if (r != rank) {
@@ -328,38 +475,35 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
         }
     }
 
-    // ── 4. Final Aggregation (Rank 0 prints) ───────────────────────────────
-    
-    // BUGFIX: Calculate the ACTUAL profit of this rank's specific g_best array,
-    // rather than relying on the shared g_pmax pruning bound.
+    // ── 7. Final Aggregation (Safe Collective Version) ─────────────────────
     int actual_local_profit = 0;
     for (int v : g_best) actual_local_profit += profit[v];
 
-    // Send final local results to Rank 0 to ensure absolute maximum is printed
-    if (rank != 0) {
-        vector<int> b;
-        b.push_back(actual_local_profit); // Send actual verified profit
-        b.push_back((int)g_best.size());
-        for (int v : g_best) b.push_back(v);
-        MPI_Send(b.data(), b.size(), MPI_INT, 0, 999 /* Final Result Tag */, MPI_COMM_WORLD);
-    } 
-    else {
-        // Rank 0 collects
-        for (int r = 1; r < P; r++) {
+    struct { int val; int rank; } in_val, out_val;
+    in_val.val = actual_local_profit;
+    in_val.rank = rank;
+
+    MPI_Allreduce(&in_val, &out_val, 1, MPI_2INT, MPI_MAXLOC, MPI_COMM_WORLD);
+
+    int global_max_profit = out_val.val;
+    int winner_rank = out_val.rank;
+
+    // NOTE: MPI_Waitall for init_reqs was moved ABOVE the main loop (Bug A fix).
+    // By the time we reach here, rank 0's Isend buffers are already freed.
+
+    if (rank == 0) {
+        if (winner_rank != 0) {
             MPI_Status st;
-            MPI_Recv(rbuf.data(), RBUF_SZ, MPI_INT, r, 999, MPI_COMM_WORLD, &st);
-            int lp = rbuf[0];
+            MPI_Probe(winner_rank, 999, MPI_COMM_WORLD, &st);
+            int cnt; MPI_Get_count(&st, MPI_INT, &cnt);
+            if ((size_t)cnt > rbuf.size()) rbuf.resize((size_t)cnt);
             
-            // Compare against Rank 0's actual verified profit
-            if (lp > actual_local_profit) {
-                actual_local_profit = lp;
-                g_best.clear();
-                int csz = rbuf[1];
-                for (int i = 0; i < csz; i++) g_best.push_back(rbuf[2 + i]);
-            }
+            MPI_Recv(rbuf.data(), cnt, MPI_INT, winner_rank, 999, MPI_COMM_WORLD, &st);
+            int csz = rbuf[1];
+            g_best.clear();
+            for (int i = 0; i < csz; i++) g_best.push_back(rbuf[2 + i]);
         }
 
-        // Print final result
         sort(g_best.begin(), g_best.end());
         ofstream fout(out_filename);
         if (!fout.is_open()) {
@@ -367,14 +511,22 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         
-        // Print the verified maximum profit
-        fout << actual_local_profit << "\n"; 
+        fout << global_max_profit << "\n"; 
         for (int i = 0; i < (int)g_best.size(); i++) {
             if (i) fout << " ";
             fout << g_best[i];
         }
         fout << "\n";
         fout.close();
+    } 
+    else {
+        if (rank == winner_rank) {
+            vector<int> b;
+            b.push_back(actual_local_profit); 
+            b.push_back((int)g_best.size());
+            for (int v : g_best) b.push_back(v);
+            MPI_Send(b.data(), (int)b.size(), MPI_INT, 0, 999, MPI_COMM_WORLD);
+        }
     }
 }
 
@@ -382,7 +534,7 @@ static void runDecentralized(int rank, int P, const char* out_filename) {
 //  Sequential fallback (P == 1)
 // ═══════════════════════════════════════════════════════════════════════════
 static void runSequential(const char* out_filename) {
-    stack<Sub> stk;
+    deque<Sub> stk;
     Sub root;
     root.cand.resize(N);
     iota(root.cand.begin(), root.cand.end(), 0);
@@ -390,10 +542,10 @@ static void runSequential(const char* out_filename) {
         if (profit[a] != profit[b]) return profit[a] > profit[b];
         return a < b;
     });
-    stk.push(root);
+    stk.push_back(root);
     
     while (!stk.empty()) {
-        Sub sp = stk.top(); stk.pop();
+        Sub sp = stk.back(); stk.pop_back();
         expand(sp, stk);
     }
     

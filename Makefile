@@ -9,7 +9,7 @@ compile_seq: seq.cpp
 	$(CXX) $(CFLAGS) -o clique_seq seq.cpp
 
 compile_mpi: test.cpp
-	$(MPICXX) $(CFLAGS) -o clique_mpi claude.cpp
+	$(MPICXX) $(CFLAGS) -o clique_mpi main.cpp
 
 run_seq: clique_seq
 	time ./clique_seq tainput.txt taoutput_seq.txt
